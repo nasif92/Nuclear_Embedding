@@ -456,15 +456,118 @@ Per-slide reference accuracy: see `compare_all.py --per_slide`. `n2v_shuf48` (Nu
 - **With the set model:** `n2v_fus_shuf48_norm` has the best Ki67 reference score of any config (88.44, 5/6 slides above `mlp`) and +2.1 CV over `shuf48_norm`, but only +0.6 on the reference, which is inside the noise. On ER (-0.8) and PR (-0.25) it is below `shuf48_norm`. There is no LEMON version of this config to compare with.
 - **Overall:** this first Nuc2Vec encoder is about as useful as LEMON on ER and a bit weaker on Ki67 and PR, never beats the QuPath features on their own, and gives at most a small, unconfirmed gain in fusion. This matches the diagnostics: it encodes tissue context more than the nucleus.
 
-### 14.3 Next round (pushing Nuc2Vec further)
+### 14.3 Round 2: keep nucleus size and stain (`pooled_keep`)
 
-New `pretrain.py` options: `--p_zoom`, `--zoom_min` (random zoom) and `--slides_per_batch k` (each batch from at most k slides, so negatives come mostly from the same slide and slide cues stop helping).
+**Why.** The round-1 neighbour montage suggested the augmentations removed the cues QuPath relies on: random zoom (up to 2x) hides nucleus size and 30% brightness/contrast jitter weakens stain intensity.
 
-Planned, one change at a time against the box run, judged first by the cross-slide same-label@k (box 0.737; LEMON 0.752; QuPath 0.827) and then downstream:
-1. **Keep nucleus size and stain:** `--p_zoom 0 --jitter 0.1 0.1 0.1 0.0`.
-2. **Same-slide negatives:** add `--slides_per_batch 4`.
-3. **Per-stain encoders** (`n2vs_*`), since the pooled encoder spends capacity separating Ki67 from ER/PR.
-4. **Tighter field of view** if neighbours still match crowding (crop smaller than 128 px at embed and train time, or embed with the background replaced as in mask mode).
-5. Optional: fuse QuPath + LEMON + Nuc2Vec; `n2v_shuf48` once `train_partition.py` accepts embedding-only input.
+**Change.** New `pretrain.py` options `--p_zoom`, `--zoom_min` and `--slides_per_batch k`. Round 2 used `--p_zoom 0 --jitter 0.1 0.1 0.1 0.0`, everything else as round 1 (box background, pooled Ki67/ER/PR, 296,659 patches from 86 slides, 30 epochs, about 80 min). The augmentation grid confirmed nuclei keep their size and brown stays brown. The pasted box edge is still visible in both views.
 
-**What would count as a win.** Nuc2Vec beats LEMON with the same model on CV and reference, or adds to the QuPath features where LEMON does not.
+**Training.** Top-1 0.999 (round 1: 0.972), alignment 0.024 (0.10), uniformity -3.95. The pretext task became nearly trivial.
+
+**Label-free tests (Ki67).**
+
+| | same-label@k | x-slide label@k | slide-ID probe |
+|---|---|---|---|
+| QuPath | 0.889 | 0.827 | - |
+| LEMON | 0.777 | 0.752 | 0.258 |
+| box (round 1) | 0.763 | 0.737 | 0.166 |
+| keep (round 2) | 0.776 | 0.750 | 0.200 |
+
+Round 2 reached LEMON's level on neighbour agreement but carries more slide identity than round 1.
+
+**Downstream, reference (CV), round 1 -> round 2.** First-round logs moved to `runs/compare_n2v_round1/`; round 2 run with `EMB_POOLED=embeddings/nuc2vec_keep_all.npz`.
+
+| config | ER | Ki67 | PR |
+|---|---|---|---|
+| `n2v_mlp` | 88.58 -> 88.27 (89.67 -> 88.95) | 79.08 -> 78.05 (81.15 -> 79.52) | 87.35 -> 83.31 (84.18 -> 81.56) |
+| `n2v_fus_mlp` | 94.96 -> 95.15 (91.22 -> 90.92) | 83.52 -> 81.69 (85.81 -> 85.33) | 93.10 -> 91.95 (87.13 -> 86.13) |
+| `n2v_fus_mlp_norm` | 95.43 -> 95.07 (93.74 -> 93.60) | 88.04 -> 87.31 (87.57 -> 87.50) | 93.45 -> 93.02 (91.25 -> 91.08) |
+| `n2v_fus_shuf48_norm` | 95.70 -> 95.76 (94.11 -> 94.44) | 88.44 -> 87.91 (90.11 -> 88.76) | 93.02 -> 92.90 (92.32 -> 91.84) |
+| reference rows: `lem_mlp` | 88.55 | 82.25 | 91.06 |
+| `shuf48_norm` (no embedding) | 96.54 | 87.82 | 93.27 |
+
+**Findings.**
+- Round 2 is equal or slightly worse downstream on almost every config and stain, despite the small gain on the Ki67 neighbour test. Label-free diagnostics did not predict downstream accuracy.
+- Neither round adds to the QuPath model with the same architecture beyond noise: `n2v_fus_shuf48_norm` vs `shuf48_norm` is -0.78 (ER), +0.09 (Ki67), -0.37 (PR) on the reference slides.
+- Embedding alone, Nuc2Vec is level with LEMON on ER and 4-8 points below it on Ki67 and PR.
+
+### 14.4 Conclusion on Nuc2Vec
+
+Two pretraining rounds with quite different augmentations (plus a mask variant evaluated label-free) give the same answer: self-supervised nucleus embeddings trained on our IHC slides are at best as useful as LEMON and do not improve on QuPath features with slide centring. Treated as a negative result; further tuning stopped. Not tried (would only complete the ablation): `--slides_per_batch 4`, per-stain encoders (`n2vs_*`), a tighter field of view, QuPath + LEMON + Nuc2Vec fusion, and `n2v_shuf48` (needs embedding-only input in `train_partition.py`).
+
+---
+
+## 15. Summary of everything so far (2026-11-27)
+
+### 15.1 What was trained and how
+
+| component | what it is | trained on our labels? | role |
+|---|---|---|---|
+| QuPath features (`all_derived`, ~108) | handcrafted shape, size, H/DAB optical density, texture, QuPath smoothing | no (no training) | main input |
+| Whole-slide centring (`_norm`) | subtract each slide's per-feature mean over all its detections | no | input calibration |
+| MLP (`train.py`) | 5 hidden layers 96-48-24-12-6, weighted sampling, 200 epochs, last epoch kept | **supervised** (pathologist region labels) | classifier |
+| Set Transformer (`train_partition.py`) | 2 attention blocks, 64-d, 4 heads; sets = spatial kd-groups (`set32`), size 1 (`set1`) or 48 random same-slide nuclei (`shuf48`) | **supervised** | classifier with context |
+| Set Transformer with all-detection context (`train_context.py`) | sets include unlabelled detections, loss on annotated nuclei only | **supervised** | realism check for spatial context |
+| LEMON embeddings | pretrained external nucleus image encoder (ViT-S/8, 384-d), frozen; PCA 64 for fusion (`fus_`) or used alone (`lem_`) | no (not trained by us) | extra input |
+| Nuc2Vec encoders (box, mask, keep) | ResNet34 -> 128-d, contrastive alignment + uniformity on 296k nucleus patches from training slides | no (**self-supervised**) | extra input (`n2v_`) |
+
+All classifiers are supervised: labels are pathologist annotation regions (Tumor / Non Tumor) on training slides. Unsupervised or label-free parts are the inputs: QuPath features, centring, LEMON and Nuc2Vec.
+
+**Evaluation.** Per stain (Ki67, ER, PR): 5-fold slide-level CV on training slides (28-30), 6 annotated reference slides (3 seeds), and the labelled-binary set (an existing classifier's calls; secondary). Model choice never uses the reference slides (last epoch kept).
+
+### 15.2 What helped
+
+| idea | verdict | evidence (reference unless noted) |
+|---|---|---|
+| Whole-slide centring | **helps most, stain-dependent** | Ki67 MLP +4.2 (4/6 slides), labelled +4.0; CV gain on ER and PR for every architecture; neutral on ER/PR reference |
+| Random same-slide sets (`shuf48`) | small help | best ER config with centring (96.54, +0.7, 5/6); Ki67 +2.7 without centring; works mainly as learned slide calibration |
+| Spatial neighbourhood sets (`set32`) | **not supported** | best in CV on Ki67/PR but never clearly beats the MLP on reference; with all-detection context the gain disappears |
+| LEMON fusion | helps on PR only | `fus_set32_norm` best PR (95.09, +2.2, 5/6); about +0.5 on Ki67 once centred; none on ER |
+| LEMON alone | worse than QuPath | 7.3 (ER), 0.8 (Ki67), 1.8 (PR) below `mlp` |
+| Nuc2Vec (self-supervised, ours) | **no measurable help** | as fusion partner within ±0.8 of the matching QuPath model; alone at or below LEMON |
+| Dividing by slide sd (z instead of centring) | hurts | Ki67 labelled-binary falls to 81.5 |
+| Domain-adversarial training, `default` feature set (from old `train_deploy.py`) | not used | decided against; CV replaces validation on reference slides |
+
+### 15.3 Recommended model per stain
+
+| stain | config | reference | CV | simpler alternative |
+|---|---|---|---|---|
+| ER | `shuf48_norm` | 96.54 | 93.73 | `mlp` 95.84 (already near ceiling) |
+| Ki67 | `shuf48_norm` / `fus_mlp_norm` / `mlp_norm` (within 0.6) | 87.82 / 87.84 / 87.29 | 87.97 / 88.33 / 85.07 | `mlp_norm`, needs no set model or LEMON |
+| PR | `fus_set32_norm` | 95.09 | 94.91 | `fus_mlp_norm` 93.96 |
+
+Caveats: 6 reference slides per stain, differences under about 0.5-1 point are noise; CV and reference rankings often disagree for spatial set models; Ki67 `set1` reference is a 2-seed mean.
+
+### 15.4 Remaining
+
+- Decide the final per-stain configs (above) and write the comparison into the thesis.
+- Optional ablations: Nuc2Vec `--slides_per_batch 4`, per-stain encoders, triple fusion; `n2v_shuf48`; third Ki67 `set1` reference seed.
+
+---
+
+## 16. Ki67 follow-ups run separately (2026-11-27)
+
+These runs used `train.py` / `train_partition.py` directly, not `run_compare.sh`. Important difference: fusion here uses the **two-scale LEMON pair** (`lemon_vits8.npz` plus the 50 µm, 40 px context embedding `lemon_vits8_50um_40px.npz`) with **no PCA**; the `fus_*` configs in sections 13-14 use the single-scale `lemon_vits8.npz` reduced to PCA 64.
+
+| check | result |
+|---|---|
+| Wider MLP (10 µm fusion, uncentred, seed 42): default 85.09; `512 96 ...` 83.95; `512 128 96 ...` 84.67 | no gain; training accuracy also lower (0.967/0.964 vs ~0.985). Width is not the limit |
+| Centred, reference (3 seeds): QuPath 87.29; two-scale LEMON + QuPath 87.92 | +0.64, 4/6 slides, p = 0.53 |
+| Centred, CV (28 slides, 3 seeds): QuPath 85.24; two-scale LEMON + QuPath 92.00 | +6.76, 24/28 slides, p < 0.001 |
+| Case leakage in Ki67 CV | 28 cases for 28 slides; none |
+| Random same-slide group size (CV, seed 42): 48 87.93/87.97, 96 87.72/87.96, 128 87.10/87.20 (raw/centred) | 48 ≈ 96 > 128; centring does not change the shuffled set model |
+
+**CV vs reference transfer (Ki67).**
+
+| idea | CV gain | reference gain |
+|---|---|---|
+| whole-slide centring (MLP) | +0.4 | +4.2 |
+| random same-slide sets (48) | +3.3 | +2.7 |
+| spatial sets (32) | +5.7 | -0.03 |
+| two-scale LEMON fusion, centred | +6.8 | +0.6 |
+
+**Reading.** On Ki67, ideas based on slide-relative statistics transfer; ideas that bring in surrounding context (spatial sets, the 50 µm LEMON context embedding) give large CV gains that do not transfer, which fits the annotation-layout explanation (section 5): context inside annotated regions predicts the region label in CV but not on new slides. The single-scale, PCA-64 fusion gives a smaller CV gain (`fus_mlp_norm` 88.33 vs `mlp_norm` 85.07, +3.3) with a similar reference gain (+0.55), consistent with the 50 µm context being what inflates CV.
+
+**Caveat on "centring is a reference-slide fix".** That holds for Ki67 only. On ER and PR (section 13) the pattern is the reverse: centring gives large CV gains (MLP +3.6 ER, +5.9 PR) and is neutral on the reference slides. So centring's effect is stain-dependent, not specific to reference slides.
+
+**Still open.** Boundary split of fusion vs QuPath (near the other class vs deep in regions; needs `--save_pred`); more seeds for the set-model CV. ER and PR with centring are done (section 13).
