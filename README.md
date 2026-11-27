@@ -389,7 +389,7 @@ Reading guide: differences below about 0.5-1 point on the reference slides are w
 
 ---
 
-## 14. In progress: Nuc2Vec-style contrastive pretraining
+## 14. Nuc2Vec-style contrastive pretraining (first round, 2026-11-27)
 
 **Motivation.** Abhineet Singh suggested pretraining nucleus embeddings contrastively (Nuc2Vec, Feng et al., MIDL 2021) instead of relying on LEMON, then using them with the MLP or set model.
 
@@ -411,12 +411,60 @@ Reading guide: differences below about 0.5-1 point on the reference slides are w
 
 **Pipeline.** `prepare_pretrain.py` (caches patches) -> `pretrain.py` (check `aug_check.png` first) -> `embed.py` (embeds every nucleus in the LEMON manifest) -> `cluster.py` (paper Figs 3-4: dendrogram, HDBSCAN montages, lowest-slide-entropy clusters, `clusters.csv`; labels used for evaluation only) and `neighbours.py` (paper Fig 2 plus same-label@k and same-slide@k) -> `run_compare.sh` with `n2v_*`, `n2vs_*`, `lem_*` configs (MLP, shuf48, fusion, fusion + whole-slide normalisation).
 
-**Status (2026-11-26).**
-- Ki67, ER and PR patches cached (Ki67 ~1.2M detections near annotations sampled to 3,500 per slide; PR 95,496 patches from 28 slides).
-- **Box pretraining finished** (pooled encoder over Ki67, ER, PR, 30 epochs, batch 256, ~1,930 nuclei/s): top-1 retrieval 0.686 after epoch 1 and 0.972 at the end (chance 0.004), alignment 0.49 -> 0.10, uniformity about -3.93. It was already 0.93 top-1 by epoch 5, so more epochs are unlikely to help. Top-1 only shows instance discrimination inside a batch and can be solved with slide-specific cues, so it is not evidence of useful features; the probe, clusters and downstream runs are the real tests.
-- **Mask pretraining** (`pooled_mask`, `--bg_mode mask`) is running. Its augmentation grid showed the polygons line up with the real nuclei; very faint nuclei leave almost empty views (try `--mask_dilate 4` if the mask run underperforms).
-- Ki67 embeddings with the box encoder are being computed (`embeddings/nuc2vec_Ki67_embeddings.npz`); probe, `cluster.py`, `neighbours.py` and the `n2v_*` comparisons are pending.
+**Pretraining runs.**
+- **Box** (`runs/pooled`, pooled over Ki67, ER, PR, 30 epochs, batch 256, about 1,930 nuclei/s): top-1 retrieval 0.686 after epoch 1, 0.93 by epoch 5, 0.972 at the end (chance 0.004); alignment 0.49 -> 0.10; uniformity about -3.93. Top-1 only shows instance discrimination inside a batch and can be solved with slide cues, so it says little about usefulness.
+- **Mask** (`runs/pooled_mask`, `--bg_mode mask --mask_dilate 2`): same settings. Its augmentation grid showed the polygons lining up with the nuclei; very faint nuclei leave almost empty views.
+- Embeddings: box encoder for all stains (`embeddings/nuc2vec_all_embeddings.npz`, 514,801 x 128) and Ki67 (`nuc2vec_Ki67_embeddings.npz`); mask encoder for Ki67 only (`nuc2vec_pooled_Ki67_mask.npz`, 200,768 x 128).
 
-**What would count as a win.** Nuc2Vec features beat LEMON with the same MLP/shuf48 on CV and reference, or add to the QuPath features where LEMON did not. **Risk to watch:** the embedding encodes slide identity (stain/scanner), which `probe.py` and the same-slide@k number will show.
+### 14.1 Label-free diagnostics (Ki67)
 
-**Results.** To be added.
+| test | QuPath (`all_derived`, z-scored) | LEMON | Nuc2Vec box | Nuc2Vec mask | reference |
+|---|---|---|---|---|---|
+| slide-identity linear probe (lower = less slide signal) | - | 0.258 | 0.166 | 0.162 | chance 0.036 |
+| same-label@k, any slide | 0.889 | 0.777 | 0.763 | 0.746 | - |
+| same-label@k, neighbours from other slides only | 0.827 | 0.752 | 0.737 | 0.725 | base rate 0.509 |
+| Ward 11-branch label purity | - | - | 0.663 | 0.599 | majority baseline 0.558 |
+
+- Nuc2Vec carries less slide identity than LEMON, but its neighbours agree on the label less often than QuPath's or LEMON's, including across slides. Box is ahead of mask on every test.
+- Clustering (paper Figs 3-4): HDBSCAN leaves most nuclei unclustered (box: 3 clusters, 91.5% noise, purity 0.676, NMI 0.127; mask: 2 clusters, Ward NMI 0.033). On the pooled encoder the Ward branches split mainly by stain type (Ki67 vs ER/PR), not by Tumor vs Non Tumor.
+- Nearest-neighbour montage (`figs/nn_Ki67.png`): QuPath neighbours match the query nucleus in darkness, size and isolation; LEMON and both Nuc2Vec encoders match the surrounding tissue (crowding, stroma) and less often the nucleus's stain colour or size. The mask encoder's neighbours for an isolated nucleus were mostly dense lymphocyte-like fields.
+- Likely cause: the augmentations make the encoder invariant to exactly the cues QuPath uses. Random zoom down to 0.5 (up to 2x magnification) removes nucleus size, and brightness/contrast jitter of 30% weakens stain intensity. Background replacement only happens in training, so at embedding time the encoder still sees the real neighbourhood.
+
+### 14.2 Downstream classification (box encoder, pooled, `n2v_*` configs)
+
+Run with `run_compare.sh`, `EXTRA="--no_labelled"` (labelled-binary nuclei have no Nuc2Vec embedding, which made the first batch fail). Reference = 6 annotated slides, 3 seeds; CV = 5-fold on training slides. Format: **reference (CV)**.
+
+| config | inputs | ER | Ki67 | PR |
+|---|---|---|---|---|
+| `lem_mlp` | LEMON only | 88.55 (89.77) | 82.25 (83.65) | 91.06 (86.71) |
+| `n2v_mlp` | Nuc2Vec only | 88.58 (89.67) | 79.08 (81.15) | 87.35 (84.18) |
+| `mlp` | QuPath | 95.84 (90.56) | 83.06 (84.65) | 92.90 (84.69) |
+| `fus_mlp` | QuPath + LEMON | 95.56 (90.92) | 84.15 (86.64) | 93.43 (87.07) |
+| `n2v_fus_mlp` | QuPath + Nuc2Vec | 94.96 (91.22) | 83.52 (85.81) | 93.10 (87.13) |
+| `mlp_norm` | QuPath, centred | 95.59 (94.14) | 87.29 (85.07) | 92.95 (90.62) |
+| `fus_mlp_norm` | QuPath + LEMON, centred | 95.42 (94.18) | 87.84 (88.33) | 93.96 (91.63) |
+| `n2v_fus_mlp_norm` | QuPath + Nuc2Vec, centred | 95.43 (93.74) | **88.04** (87.57) | 93.45 (91.25) |
+| `shuf48_norm` | QuPath, set model, centred | **96.54** (93.73) | 87.82 (87.97) | 93.27 (89.23) |
+| `n2v_fus_shuf48_norm` | QuPath + Nuc2Vec, set model, centred | 95.70 (94.11) | **88.44** (90.11) | 93.02 (92.32) |
+| `fus_set32_norm` | QuPath + LEMON, set 32, centred | 94.03 (93.94) | 87.28 (91.00) | **95.09** (94.91) |
+
+Per-slide reference accuracy: see `compare_all.py --per_slide`. `n2v_shuf48` (Nuc2Vec only, set model) was not run: `train_partition.py --input` accepts only `qupath` and `fusion`.
+
+**Findings.**
+- **As a replacement for LEMON:** tied on ER (88.58 vs 88.55), worse on Ki67 (-3.2) and PR (-3.7). Both embedding-only models fail on ER CIS24-000938 (77.0 and 76.7), so that slide is a domain shift problem for image embeddings in general.
+- **As an add-on to QuPath:** with centring, +0.75 on Ki67 and +0.5 on PR over `mlp_norm`, -0.2 on ER; without centring it lowers ER by 0.9. About the same as LEMON on ER and Ki67, 0.5 below on PR.
+- **With the set model:** `n2v_fus_shuf48_norm` has the best Ki67 reference score of any config (88.44, 5/6 slides above `mlp`) and +2.1 CV over `shuf48_norm`, but only +0.6 on the reference, which is inside the noise. On ER (-0.8) and PR (-0.25) it is below `shuf48_norm`. There is no LEMON version of this config to compare with.
+- **Overall:** this first Nuc2Vec encoder is about as useful as LEMON on ER and a bit weaker on Ki67 and PR, never beats the QuPath features on their own, and gives at most a small, unconfirmed gain in fusion. This matches the diagnostics: it encodes tissue context more than the nucleus.
+
+### 14.3 Next round (pushing Nuc2Vec further)
+
+New `pretrain.py` options: `--p_zoom`, `--zoom_min` (random zoom) and `--slides_per_batch k` (each batch from at most k slides, so negatives come mostly from the same slide and slide cues stop helping).
+
+Planned, one change at a time against the box run, judged first by the cross-slide same-label@k (box 0.737; LEMON 0.752; QuPath 0.827) and then downstream:
+1. **Keep nucleus size and stain:** `--p_zoom 0 --jitter 0.1 0.1 0.1 0.0`.
+2. **Same-slide negatives:** add `--slides_per_batch 4`.
+3. **Per-stain encoders** (`n2vs_*`), since the pooled encoder spends capacity separating Ki67 from ER/PR.
+4. **Tighter field of view** if neighbours still match crowding (crop smaller than 128 px at embed and train time, or embed with the background replaced as in mask mode).
+5. Optional: fuse QuPath + LEMON + Nuc2Vec; `n2v_shuf48` once `train_partition.py` accepts embedding-only input.
+
+**What would count as a win.** Nuc2Vec beats LEMON with the same model on CV and reference, or adds to the QuPath features where LEMON does not.
